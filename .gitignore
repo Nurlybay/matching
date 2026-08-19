@@ -1,0 +1,9 @@
+*.parquet
+.DS_Store
+.venv/
+__pycache__/
+*.pyc
+*.joblib
+*.pth
+*.bin
+.ipynb_checkpoints/
