@@ -84,7 +84,11 @@ def build_feature_matrix(match_df, items_by_id, n_jobs=1, chunk_size=200_000):
         (id1[i : i + chunk_size], id2[i : i + chunk_size])
         for i in range(0, n, chunk_size)
     ]
-    with ctx.Pool(processes=n_jobs) as pool:
+    # fork() on a parent with a large RSS (the item catalog) pays a real, roughly
+    # linear-in-process-count cost to duplicate page tables; forking more workers
+    # than there is work for just adds that cost for nothing.
+    n_workers = min(n_jobs, len(chunks))
+    with ctx.Pool(processes=n_workers) as pool:
         results = pool.map(_features_chunk_global, chunks)
 
     _ITEMS_BY_ID = None
