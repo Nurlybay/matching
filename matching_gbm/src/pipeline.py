@@ -12,13 +12,27 @@ from src.features import FEATURE_NAMES, pair_features, prepare_item
 _ITEMS_BY_ID = None
 
 
-def load_items_by_id(items_path):
+def referenced_ids(match_path):
+    """IDs actually touched by a matches file — filtering to this before
+    loading the item catalog avoids paying memory for items that never
+    appear in a pair."""
+    df = pd.read_parquet(match_path, columns=["id1", "id2"])
+    return set(df["id1"].values) | set(df["id2"].values)
+
+
+def load_items_by_id(items_path, required_ids=None):
+    """Loads only the raw (name, attributes, category) tuple per item —
+    NOT the parsed/tokenized form. Parsing 12M+ items upfront (frozensets,
+    dicts from JSON) is what was blowing past the container's memory limit;
+    prepare_item() is instead called lazily, per pair, in _features_chunk."""
     df = pd.read_parquet(items_path, columns=["id", "name", "attributes", "category"])
+    if required_ids is not None:
+        df = df[df["id"].isin(required_ids)]
     items_by_id = {}
     for item_id, name, attributes, category in zip(
         df["id"].values, df["name"].values, df["attributes"].values, df["category"].values
     ):
-        items_by_id[item_id] = prepare_item(item_id, name, attributes, category)
+        items_by_id[item_id] = (name, attributes, category)
     return items_by_id
 
 
@@ -26,9 +40,21 @@ def _features_chunk(id1_chunk, id2_chunk, items_by_id):
     n = len(id1_chunk)
     feats = np.empty((n, len(FEATURE_NAMES)), dtype=np.float32)
     keep = np.ones(n, dtype=bool)
+    prepared_cache = {}  # scoped to this chunk only — freed when the chunk returns
+
+    def get_prepared(item_id):
+        prepared = prepared_cache.get(item_id)
+        if prepared is None:
+            raw = items_by_id.get(item_id)
+            if raw is None:
+                return None
+            prepared = prepare_item(item_id, *raw)
+            prepared_cache[item_id] = prepared
+        return prepared
+
     for i in range(n):
-        it1 = items_by_id.get(id1_chunk[i])
-        it2 = items_by_id.get(id2_chunk[i])
+        it1 = get_prepared(id1_chunk[i])
+        it2 = get_prepared(id2_chunk[i])
         if it1 is None or it2 is None:
             keep[i] = False
             continue

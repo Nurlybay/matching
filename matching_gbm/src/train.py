@@ -10,7 +10,7 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 
 from src.features import FEATURE_NAMES
-from src.pipeline import build_feature_matrix, load_items_by_id
+from src.pipeline import build_feature_matrix, load_items_by_id, referenced_ids
 
 HUMAN_WEIGHT = 3.0
 LLM_BASE_WEIGHT = 1.0
@@ -56,7 +56,10 @@ def main():
         X, y, w = feats_h, y_h, w_h
     else:
         print("[3/5] Loading items (full set, for LLM-labeled matches)...")
-        items_full = load_items_by_id(args.items_full_path)
+        needed_ids = referenced_ids(args.matches_llm_path)
+        print(f"  -> {len(needed_ids)} unique items referenced by matches_llm")
+        items_full = load_items_by_id(args.items_full_path, required_ids=needed_ids)
+        del needed_ids
 
         print("[4/5] Building features for LLM-labeled matches...")
         feats_l, y_l, w_l = build_source(
