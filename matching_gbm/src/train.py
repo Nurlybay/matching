@@ -18,9 +18,13 @@ LLM_BASE_WEIGHT = 1.0
 
 def build_source(match_path, items_by_id, weight_fn, n_jobs):
     match_df = pd.read_parquet(match_path)
-    feats, keep = build_feature_matrix(match_df, items_by_id, n_jobs=n_jobs)
-    target = match_df["target"].values[keep]
-    feats = feats[keep]
+    feats = build_feature_matrix(match_df, items_by_id, n_jobs=n_jobs)
+    # An all-NaN row means neither pair_features branch ran — one of the two
+    # items wasn't in items_by_id. Such rows carry no signal for training
+    # (unlike at inference, we're free to just drop them here).
+    has_signal = ~np.isnan(feats).all(axis=1)
+    feats = feats[has_signal]
+    target = match_df["target"].values[has_signal]
     y_hard = (target >= 0.5).astype(np.int32)
     weight = weight_fn(target)
     return feats, y_hard, weight

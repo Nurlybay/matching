@@ -20,7 +20,7 @@ def main() -> None:
 
     print("[2/4] Building features...")
     match_df = pd.read_parquet(args.matches_path)
-    feats, keep = build_feature_matrix(match_df, items_by_id, n_jobs=1)
+    feats = build_feature_matrix(match_df, items_by_id, n_jobs=1)
 
     print("[3/4] Loading model and predicting...")
     clf = joblib.load(MODEL_PATH)
@@ -28,8 +28,8 @@ def main() -> None:
 
     print(f"[4/4] Saving predictions to {args.output_path}...")
     results_df = pd.DataFrame({
-        "id1": match_df["id1"].values[keep],
-        "id2": match_df["id2"].values[keep],
+        "id1": match_df["id1"].values,
+        "id2": match_df["id2"].values,
         "predict": predictions,
     })
     results_df.to_csv(args.output_path, index=False)

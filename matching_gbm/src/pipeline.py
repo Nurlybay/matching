@@ -30,8 +30,12 @@ def load_items_by_id(items_path, required_ids=None):
 
 def _features_chunk(id1_chunk, id2_chunk, items_by_id):
     n = len(id1_chunk)
-    feats = np.empty((n, len(FEATURE_NAMES)), dtype=np.float32)
-    keep = np.ones(n, dtype=bool)
+    # NaN, not np.empty: rows for pairs with a missing item are left as NaN
+    # rather than dropped, so every row of match_df always gets a row here —
+    # callers (run.py in particular) must be able to align predictions back
+    # to id1/id2 1:1. HistGradientBoostingClassifier handles NaN features
+    # natively, both for fit() and predict().
+    feats = np.full((n, len(FEATURE_NAMES)), np.nan, dtype=np.float32)
     prepared_cache = {}  # scoped to this chunk only — dropped when the chunk ends
 
     def get_prepared(item_id):
@@ -48,15 +52,16 @@ def _features_chunk(id1_chunk, id2_chunk, items_by_id):
         it1 = get_prepared(id1_chunk[i])
         it2 = get_prepared(id2_chunk[i])
         if it1 is None or it2 is None:
-            keep[i] = False
             continue
         feats[i] = pair_features(it1, it2)
-    return feats, keep
+    return feats
 
 
 def build_feature_matrix(match_df, items_by_id, n_jobs=1, chunk_size=200_000):
     """Processes pairs in fixed-size chunks so the per-item prepared-object
-    cache stays bounded regardless of dataset size.
+    cache stays bounded regardless of dataset size. Returns a feature matrix
+    with exactly len(match_df) rows, in the same order — rows for pairs
+    with a missing item are NaN, never dropped (see _features_chunk).
 
     n_jobs is currently ignored: an earlier multiprocessing.Pool(fork) version
     of this looked like free parallelism, but CPython bumps every touched
@@ -72,12 +77,8 @@ def build_feature_matrix(match_df, items_by_id, n_jobs=1, chunk_size=200_000):
     id2 = match_df["id2"].values
     n = len(match_df)
 
-    feats_parts, keep_parts = [], []
-    for i in range(0, n, chunk_size):
-        f, k = _features_chunk(id1[i : i + chunk_size], id2[i : i + chunk_size], items_by_id)
-        feats_parts.append(f)
-        keep_parts.append(k)
-
-    feats = np.concatenate(feats_parts, axis=0)
-    keep = np.concatenate(keep_parts, axis=0)
-    return feats, keep
+    feats_parts = [
+        _features_chunk(id1[i : i + chunk_size], id2[i : i + chunk_size], items_by_id)
+        for i in range(0, n, chunk_size)
+    ]
+    return np.concatenate(feats_parts, axis=0)
