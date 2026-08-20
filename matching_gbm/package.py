@@ -129,8 +129,14 @@ def main():
         print("[3/3] Zipping...")
         out_path = os.path.abspath(args.out)
         with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for root, _, files in os.walk(staging):
+            for root, dirs, files in os.walk(staging):
+                # The smoke test runs before this and leaves behind bytecode
+                # compiled for whichever interpreter built the archive, which
+                # is not necessarily the one in the image.
+                dirs[:] = [d for d in dirs if d != "__pycache__"]
                 for name in files:
+                    if name.endswith(".pyc"):
+                        continue
                     full = os.path.join(root, name)
                     zf.write(full, os.path.relpath(full, staging))
 
