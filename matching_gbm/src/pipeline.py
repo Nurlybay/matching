@@ -4,6 +4,35 @@ import pandas as pd
 from src.features import FEATURE_NAMES, pair_features, prepare_item
 
 
+def connected_component_groups(id1, id2):
+    """Connected-component id per pair, over the graph where items are nodes
+    and pairs are edges. Pairs sharing an item — or transitively connected
+    through a chain of shared items, as near-duplicate clusters commonly are
+    in product matching — land in the same group, so a group-aware split
+    (GroupShuffleSplit) can keep each cluster entirely on one side instead of
+    leaking near-identical feature vectors across train/val."""
+    parent = {}
+
+    def find(x):
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    for a, b in zip(id1, id2):
+        if a not in parent:
+            parent[a] = a
+        if b not in parent:
+            parent[b] = b
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    return np.fromiter((find(a) for a in id1), dtype=np.int64, count=len(id1))
+
+
 def referenced_ids(match_path):
     """IDs actually touched by a matches file — filtering to this before
     loading the item catalog avoids paying memory for items that never

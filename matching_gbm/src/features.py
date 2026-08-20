@@ -1,8 +1,11 @@
 import json
+import math
 import re
 from difflib import SequenceMatcher
 
 _TOKEN_RE = re.compile(r"[a-zA-Zа-яА-ЯёЁ0-9]+")
+
+NAN = math.nan
 
 FEATURE_NAMES = [
     "name_seq_ratio",
@@ -16,6 +19,8 @@ FEATURE_NAMES = [
     "attr_exact_match_ratio",
     "attr_value_jaccard",
     "attr_count_diff",
+    "attrs1_empty",
+    "attrs2_empty",
 ]
 
 
@@ -57,8 +62,10 @@ def prepare_item(item_id, name, attributes, category):
 
 
 def _seq_ratio(a, b):
+    # Both empty: nothing to compare, not a match — NaN, not a score.
+    # Exactly one empty: a real, informative answer (they differ maximally).
     if not a and not b:
-        return 1.0
+        return NAN
     if not a or not b:
         return 0.0
     return SequenceMatcher(None, a, b).ratio()
@@ -66,10 +73,10 @@ def _seq_ratio(a, b):
 
 def _jaccard(a, b):
     if not a and not b:
-        return 1.0
+        return NAN
     union = a | b
     if not union:
-        return 1.0
+        return NAN
     return len(a & b) / len(union)
 
 
@@ -85,6 +92,15 @@ def pair_features(item1, item2):
     union_keys = a1.keys() | a2.keys()
     exact_matches = sum(1 for k in shared_keys if a1[k] == a2[k])
 
+    # union_keys is empty exactly when both items have zero attributes —
+    # no signal, so NaN rather than a fabricated "perfect match".
+    attr_key_jaccard = (len(shared_keys) / len(union_keys)) if union_keys else NAN
+    # shared_keys is empty both when both items have zero attributes AND when
+    # they have disjoint (non-overlapping) key sets — in either case there is
+    # no comparable key to score an exact-match rate over, so NaN, not 0.0
+    # (0.0 would read as "checked and none matched", which isn't true here).
+    attr_exact_match_ratio = (exact_matches / len(shared_keys)) if shared_keys else NAN
+
     return (
         _seq_ratio(n1, n2),
         _jaccard(t1, t2),
@@ -92,9 +108,11 @@ def pair_features(item1, item2):
         float(abs(len1 - len2)),
         float(len(t1 & t2)),
         float(item1["category"] == item2["category"]),
-        (len(shared_keys) / len(union_keys)) if union_keys else 1.0,
+        attr_key_jaccard,
         float(len(shared_keys)),
-        (exact_matches / len(shared_keys)) if shared_keys else 0.0,
+        attr_exact_match_ratio,
         _jaccard(item1["attr_value_tokens"], item2["attr_value_tokens"]),
         float(abs(len(a1) - len(a2))),
+        float(len(a1) == 0),
+        float(len(a2) == 0),
     )

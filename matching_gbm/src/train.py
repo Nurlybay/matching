@@ -7,16 +7,29 @@ import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import average_precision_score, roc_auc_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit
 
 from src.features import FEATURE_NAMES
-from src.pipeline import build_feature_matrix, load_items_by_id, referenced_ids
+from src.pipeline import (
+    build_feature_matrix,
+    connected_component_groups,
+    load_items_by_id,
+    referenced_ids,
+)
 
 LLM_BASE_WEIGHT = 1.0
 
 
-def build_source(match_path, items_by_id, weight_fn, n_jobs, drop_targets=None):
+def build_source(match_path, items_by_id, weight_fn, n_jobs, drop_targets=None, exclude_items=None):
     match_df = pd.read_parquet(match_path)
+    if exclude_items:
+        # Items already spent on the human validation split must not come
+        # back in through an LLM-labeled row reusing the same item — that
+        # would let the model see a near-duplicate of a held-out pair
+        # during training.
+        touches_excluded = match_df["id1"].isin(exclude_items) | match_df["id2"].isin(exclude_items)
+        match_df = match_df[~touches_excluded].reset_index(drop=True)
+
     feats = build_feature_matrix(match_df, items_by_id, n_jobs=n_jobs)
     target = match_df["target"].values
 
@@ -54,25 +67,35 @@ def main():
     items_human = load_items_by_id(args.items_human_path)
 
     print("[2/6] Building features for human-labeled matches...")
-    feats_h, y_h, _ = build_source(
-        args.matches_path, items_human,
-        weight_fn=lambda t: np.ones(len(t), dtype=np.float32),
-        n_jobs=args.n_jobs,
-    )
-    print(f"  -> {len(y_h)} pairs, positive rate {y_h.mean():.3f}")
+    match_h_df = pd.read_parquet(args.matches_path)
+    feats_h_all = build_feature_matrix(match_h_df, items_human, n_jobs=args.n_jobs)
+    valid_h = ~np.isnan(feats_h_all).all(axis=1)
+    match_h_df = match_h_df[valid_h].reset_index(drop=True)
+    feats_h_all = feats_h_all[valid_h]
+    y_h_all = (match_h_df["target"].values >= 0.5).astype(np.int32)
+    print(f"  -> {len(y_h_all)} pairs, positive rate {y_h_all.mean():.3f}")
     del items_human
 
-    print("[3/6] Holding out a validation split from human labels ONLY...")
-    # Critical: this split happens before any mixing with LLM-labeled data, and
-    # validation below is scored exclusively on this human-only slice. Mixing
-    # human + LLM rows and splitting randomly (as an earlier version did) makes
-    # the validation set >95% LLM-labeled, since matches_llm dwarfs matches —
-    # the reported metric would mostly measure agreement with the LLM labeler,
-    # not with ground truth.
-    h_train_feats, h_val_feats, y_h_train, y_h_val = train_test_split(
-        feats_h, y_h, test_size=0.2, random_state=1234, stratify=y_h,
-    )
-    print(f"  -> human train={len(y_h_train)}, human val={len(y_h_val)}")
+    print("[3/6] Holding out a validation split from human labels ONLY, "
+          "grouped by connected item clusters...")
+    # Plain random splitting would let pairs sharing an item — or transitively
+    # linked through a chain of shared items, as near-duplicate clusters
+    # commonly are — land on both sides, so the model gets scored partly on
+    # near-copies of what it trained on. GroupShuffleSplit keeps each
+    # connected cluster entirely on one side.
+    groups_h = connected_component_groups(match_h_df["id1"].values, match_h_df["id2"].values)
+    print(f"  -> {len(np.unique(groups_h))} connected components among {len(groups_h)} human pairs")
+
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=1234)
+    train_idx, val_idx = next(gss.split(feats_h_all, y_h_all, groups=groups_h))
+
+    h_train_feats, h_val_feats = feats_h_all[train_idx], feats_h_all[val_idx]
+    y_h_train, y_h_val = y_h_all[train_idx], y_h_all[val_idx]
+    print(f"  -> human train={len(y_h_train)}, human val={len(y_h_val)} "
+          f"(split by group, so not exactly 80/20)")
+
+    val_items = set(match_h_df.iloc[val_idx]["id1"]) | set(match_h_df.iloc[val_idx]["id2"])
+    del match_h_df, feats_h_all, y_h_all
 
     if args.skip_llm:
         feats_l = np.empty((0, len(FEATURE_NAMES)), dtype=np.float32)
@@ -94,8 +117,10 @@ def main():
             weight_fn=lambda t: LLM_BASE_WEIGHT * (2.0 * np.abs(t - 0.5)),
             n_jobs=args.n_jobs,
             drop_targets=[0.5],
+            exclude_items=val_items,
         )
-        print(f"  -> {len(y_l)} pairs (target==0.5 dropped), positive rate {y_l.mean():.3f}")
+        print(f"  -> {len(y_l)} pairs (target==0.5 and val-item overlap dropped), "
+              f"positive rate {y_l.mean():.3f}")
         del items_full
 
     print("[6/6] Sweeping HUMAN_WEIGHT, scoring on held-out human labels only...")
