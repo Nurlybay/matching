@@ -76,6 +76,129 @@ def build_pair_texts(match_df, items_by_id, max_attrs):
     return texts1, texts2
 
 
+def make_loaders(train_ds, val_ds, tokenizer, args, device):
+    collate = make_collate(tokenizer, args.max_length)
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate,
+        num_workers=args.num_workers, pin_memory=(device.type == "cuda"), drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=args.eval_batch_size, shuffle=False, collate_fn=collate,
+        num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
+    )
+    return train_loader, val_loader
+
+
+def train_stage(model, tokenizer, train_loader, val_loader, val_labels,
+                device, amp_dtype, epochs, lr, warmup_ratio, stage, save_dir=None):
+    """Runs one training stage, always scoring on the same human validation set.
+
+    Validation is human-labeled even during LLM pretraining: the point of that
+    stage is what it does for human-label performance, and tracking agreement
+    with the LLM labeler instead would measure the wrong thing entirely.
+    """
+    steps = len(train_loader) * epochs
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, int(steps * warmup_ratio), steps
+    )
+    # Soft targets pass through unchanged: BCEWithLogitsLoss accepts any target
+    # in [0,1], and for an LLM score of t it is minimized at sigmoid(z)=t. A
+    # maximally unsure t=0.5 therefore contributes almost no gradient in either
+    # direction on its own — the uncertainty is handled by the loss rather than
+    # by an external weighting term.
+    loss_fn = torch.nn.BCEWithLogitsLoss()
+
+    print(f"[{stage}] {len(train_loader)} steps/epoch x {epochs} epochs, lr={lr:g}")
+    best_auc = -1.0
+    for epoch in range(epochs):
+        model.train()
+        running, seen, t0 = 0.0, 0, time.time()
+        for step, batch in enumerate(train_loader, 1):
+            target = batch.pop("labels").to(device, non_blocking=True)
+            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+
+            with torch.autocast("cuda", dtype=amp_dtype, enabled=device.type == "cuda"):
+                logits = model(**batch).logits.squeeze(-1)
+            loss = loss_fn(logits.float(), target)
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+
+            running += loss.item() * len(target)
+            seen += len(target)
+            if step % 200 == 0:
+                rate = seen / (time.time() - t0)
+                print(f"  [{stage}] epoch {epoch} step {step}/{len(train_loader)} "
+                      f"loss={running / seen:.4f} {rate:.0f} pairs/s")
+
+        val_scores = predict_scores(model, val_loader, device, amp_dtype)
+        auc = roc_auc_score(val_labels, val_scores)
+        ap = average_precision_score(val_labels, val_scores)
+        print(f"  [{stage}] epoch {epoch}: human-val ROC-AUC={auc:.4f} PR-AUC={ap:.4f}")
+
+        if auc > best_auc:
+            best_auc = auc
+            if save_dir:
+                os.makedirs(save_dir, exist_ok=True)
+                model.save_pretrained(save_dir)
+                tokenizer.save_pretrained(save_dir)
+                print(f"  [{stage}] saved to {save_dir} (best so far)")
+
+    return best_auc
+
+
+def load_pretrain_pairs(args, exclude_items):
+    """LLM-labeled pairs for pretraining, optionally restricted to categories.
+
+    Targeting categories is the point rather than an optimization: measured
+    per-category ROC-AUC runs from 0.67 (Автотовары) to 0.95 (Аптека), and the
+    weakest categories are exactly where the LLM file has the most coverage —
+    Автотовары holds 986k items there against 38k in the human file. A random
+    sample of 11M pairs would spend most of its budget on categories that are
+    already strong.
+    """
+    print("  reading item categories...")
+    cats_df = pd.read_parquet(args.pretrain_items_path, columns=["id", "category"])
+    if args.pretrain_categories:
+        wanted = {c.strip() for c in args.pretrain_categories.split(",")}
+        missing = wanted - set(cats_df["category"].unique())
+        if missing:
+            raise ValueError(f"unknown categories: {sorted(missing)}")
+        cats_df = cats_df[cats_df["category"].isin(wanted)]
+        print(f"  -> {len(cats_df)} items in {sorted(wanted)}")
+    keep_ids = set(cats_df["id"].values)
+    del cats_df
+
+    match_df = pd.read_parquet(args.pretrain_matches_path)
+    in_scope = match_df["id1"].isin(keep_ids) & match_df["id2"].isin(keep_ids)
+    match_df = match_df[in_scope]
+    print(f"  -> {len(match_df)} pairs within scope")
+
+    # An item held out for human validation must not appear in pretraining
+    # either, or the fine-tuned model has effectively seen the val pairs.
+    touches_val = match_df["id1"].isin(exclude_items) | match_df["id2"].isin(exclude_items)
+    match_df = match_df[~touches_val]
+
+    # t == 0.5 carries no directional signal at all; drop rather than train on it.
+    match_df = match_df[match_df["target"] != 0.5]
+
+    if args.max_pretrain_pairs and len(match_df) > args.max_pretrain_pairs:
+        match_df = match_df.sample(
+            n=args.max_pretrain_pairs, random_state=1234
+        )
+    match_df = match_df.reset_index(drop=True)
+    print(f"  -> {len(match_df)} pretraining pairs after filtering")
+
+    needed = set(match_df["id1"].values) | set(match_df["id2"].values)
+    items = load_items_by_id(args.pretrain_items_path, required_ids=needed)
+    match_df = match_df[valid_pairs_mask(match_df, items)].reset_index(drop=True)
+    return match_df, items
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--items_human_path", default="items_human.parquet")
@@ -92,6 +215,15 @@ def main():
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--max_train_pairs", type=int, default=0,
                         help="cap training pairs for a quick smoke run (0 = use all)")
+
+    parser.add_argument("--pretrain_matches_path", default=None,
+                        help="LLM-labeled matches to pretrain on before fine-tuning")
+    parser.add_argument("--pretrain_items_path", default="items.parquet")
+    parser.add_argument("--pretrain_categories", default=None,
+                        help="comma-separated categories to restrict pretraining to")
+    parser.add_argument("--max_pretrain_pairs", type=int, default=1_000_000)
+    parser.add_argument("--pretrain_epochs", type=int, default=1)
+    parser.add_argument("--pretrain_lr", type=float, default=3e-5)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -120,12 +252,14 @@ def main():
         train_idx = train_idx[: args.max_train_pairs]
         print(f"  -> capped train to {len(train_idx)} pairs")
 
+    val_items = set(match_df.iloc[val_idx]["id1"]) | set(match_df.iloc[val_idx]["id2"])
     train_ds = PairDataset(
         [texts1[i] for i in train_idx], [texts2[i] for i in train_idx], labels[train_idx]
     )
     val_ds = PairDataset(
         [texts1[i] for i in val_idx], [texts2[i] for i in val_idx], labels[val_idx]
     )
+    val_labels = labels[val_idx]
 
     print("[4/5] Loading model...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
@@ -133,61 +267,31 @@ def main():
         args.model_name, num_labels=1
     ).to(device)
 
-    collate = make_collate(tokenizer, args.max_length)
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate,
-        num_workers=args.num_workers, pin_memory=(device.type == "cuda"), drop_last=True,
+    if args.pretrain_matches_path:
+        print("[4.5/5] Building LLM pretraining set...")
+        pre_df, pre_items = load_pretrain_pairs(args, val_items)
+        pre_texts1, pre_texts2 = build_pair_texts(pre_df, pre_items, args.max_attrs)
+        del pre_items
+        # Soft targets, not binarized: t is the labeler's confidence, and
+        # rounding it to 0/1 throws that away right where it is most useful.
+        pre_labels = pre_df["target"].values.astype(np.float32)
+        pre_ds = PairDataset(pre_texts1, pre_texts2, pre_labels)
+
+        pre_loader, val_loader = make_loaders(pre_ds, val_ds, tokenizer, args, device)
+        train_stage(
+            model, tokenizer, pre_loader, val_loader, val_labels, device, amp_dtype,
+            epochs=args.pretrain_epochs, lr=args.pretrain_lr,
+            warmup_ratio=args.warmup_ratio, stage="pretrain", save_dir=None,
+        )
+        del pre_ds, pre_loader, pre_texts1, pre_texts2, pre_df
+
+    print("[5/5] Fine-tuning on human labels...")
+    train_loader, val_loader = make_loaders(train_ds, val_ds, tokenizer, args, device)
+    best_auc = train_stage(
+        model, tokenizer, train_loader, val_loader, val_labels, device, amp_dtype,
+        epochs=args.epochs, lr=args.lr, warmup_ratio=args.warmup_ratio,
+        stage="finetune", save_dir=args.output_dir,
     )
-    val_loader = DataLoader(
-        val_ds, batch_size=args.eval_batch_size, shuffle=False, collate_fn=collate,
-        num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
-    )
-
-    steps = len(train_loader) * args.epochs
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer, int(steps * args.warmup_ratio), steps
-    )
-    loss_fn = torch.nn.BCEWithLogitsLoss()
-
-    print(f"[5/5] Training: {len(train_loader)} steps/epoch x {args.epochs} epochs")
-    best_auc = -1.0
-    for epoch in range(args.epochs):
-        model.train()
-        running, seen, t0 = 0.0, 0, time.time()
-        for step, batch in enumerate(train_loader, 1):
-            target = batch.pop("labels").to(device, non_blocking=True)
-            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-
-            with torch.autocast("cuda", dtype=amp_dtype, enabled=device.type == "cuda"):
-                logits = model(**batch).logits.squeeze(-1)
-            loss = loss_fn(logits.float(), target)
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
-
-            running += loss.item() * len(target)
-            seen += len(target)
-            if step % 200 == 0:
-                rate = seen / (time.time() - t0)
-                print(f"  epoch {epoch} step {step}/{len(train_loader)} "
-                      f"loss={running / seen:.4f} {rate:.0f} pairs/s")
-
-        val_scores = predict_scores(model, val_loader, device, amp_dtype)
-        auc = roc_auc_score(labels[val_idx], val_scores)
-        ap = average_precision_score(labels[val_idx], val_scores)
-        print(f"  epoch {epoch}: human-val ROC-AUC={auc:.4f} PR-AUC={ap:.4f}")
-
-        if auc > best_auc:
-            best_auc = auc
-            os.makedirs(args.output_dir, exist_ok=True)
-            model.save_pretrained(args.output_dir)
-            tokenizer.save_pretrained(args.output_dir)
-            print(f"  saved to {args.output_dir} (best so far)")
-
     print(f"Best human-val ROC-AUC={best_auc:.4f}")
 
 
