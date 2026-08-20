@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup
 
 from src.features import item_text, prepare_item
-from src.pipeline import load_items_by_id
+from src.pipeline import load_item_texts, load_items_by_id
 from src.split import human_train_val_indices, valid_pairs_mask
 
 DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
@@ -161,22 +161,23 @@ def load_pretrain_pairs(args, exclude_items):
     sample of 11M pairs would spend most of its budget on categories that are
     already strong.
     """
-    print("  reading item categories...")
-    cats_df = pd.read_parquet(args.pretrain_items_path, columns=["id", "category"])
+    match_df = pd.read_parquet(args.pretrain_matches_path)
+
     if args.pretrain_categories:
+        print("  reading item categories...")
+        cats_df = pd.read_parquet(args.pretrain_items_path, columns=["id", "category"])
         wanted = {c.strip() for c in args.pretrain_categories.split(",")}
         missing = wanted - set(cats_df["category"].unique())
         if missing:
             raise ValueError(f"unknown categories: {sorted(missing)}")
-        cats_df = cats_df[cats_df["category"].isin(wanted)]
-        print(f"  -> {len(cats_df)} items in {sorted(wanted)}")
-    keep_ids = set(cats_df["id"].values)
-    del cats_df
+        keep_ids = set(cats_df[cats_df["category"].isin(wanted)]["id"].values)
+        del cats_df
+        print(f"  -> {len(keep_ids)} items in {sorted(wanted)}")
 
-    match_df = pd.read_parquet(args.pretrain_matches_path)
-    in_scope = match_df["id1"].isin(keep_ids) & match_df["id2"].isin(keep_ids)
-    match_df = match_df[in_scope]
-    print(f"  -> {len(match_df)} pairs within scope")
+        in_scope = match_df["id1"].isin(keep_ids) & match_df["id2"].isin(keep_ids)
+        match_df = match_df[in_scope]
+        del keep_ids
+        print(f"  -> {len(match_df)} pairs within scope")
 
     # An item held out for human validation must not appear in pretraining
     # either, or the fine-tuned model has effectively seen the val pairs.
@@ -194,9 +195,16 @@ def load_pretrain_pairs(args, exclude_items):
     print(f"  -> {len(match_df)} pretraining pairs after filtering")
 
     needed = set(match_df["id1"].values) | set(match_df["id2"].values)
-    items = load_items_by_id(args.pretrain_items_path, required_ids=needed)
-    match_df = match_df[valid_pairs_mask(match_df, items)].reset_index(drop=True)
-    return match_df, items
+    print(f"  loading texts for {len(needed)} items...")
+    texts = load_item_texts(args.pretrain_items_path, needed, max_attrs=args.max_attrs)
+    known = texts.__contains__
+    usable = np.fromiter(
+        (known(a) and known(b) for a, b in zip(match_df["id1"].values, match_df["id2"].values)),
+        dtype=bool, count=len(match_df),
+    )
+    match_df = match_df[usable].reset_index(drop=True)
+    print(f"  -> {len(match_df)} pairs with both items present")
+    return match_df, texts
 
 
 def main():
@@ -269,9 +277,12 @@ def main():
 
     if args.pretrain_matches_path:
         print("[4.5/5] Building LLM pretraining set...")
-        pre_df, pre_items = load_pretrain_pairs(args, val_items)
-        pre_texts1, pre_texts2 = build_pair_texts(pre_df, pre_items, args.max_attrs)
-        del pre_items
+        pre_df, pre_item_texts = load_pretrain_pairs(args, val_items)
+        # Lists of references into the same text objects — two pointers per
+        # pair, not two copies of the text.
+        pre_texts1 = [pre_item_texts[i] for i in pre_df["id1"].values]
+        pre_texts2 = [pre_item_texts[i] for i in pre_df["id2"].values]
+        del pre_item_texts
         # Soft targets, not binarized: t is the labeler's confidence, and
         # rounding it to 0/1 throws that away right where it is most useful.
         pre_labels = pre_df["target"].values.astype(np.float32)

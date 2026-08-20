@@ -113,6 +113,35 @@ def build_feature_matrix(match_df, items_by_id, n_jobs=1, chunk_size=200_000):
     return np.concatenate(feats_parts, axis=0)
 
 
+def load_item_texts(items_path, required_ids, max_attrs=12, chunk_rows=1_000_000):
+    """id -> encoder text, without ever materializing the raw-field dict.
+
+    load_items_by_id followed by build_pair_texts holds both the raw tuples and
+    the growing text cache at once, and that peak is what caps how much LLM
+    data can be pretrained on — the measured lever on quality (§6). Formatting
+    each row as it is read, in row-group batches, keeps only the texts.
+    """
+    import pyarrow.parquet as pq
+
+    from src.features import item_text, prepare_item
+
+    texts = {}
+    parquet_file = pq.ParquetFile(items_path)
+    for batch in parquet_file.iter_batches(
+        batch_size=chunk_rows, columns=["id", "name", "attributes", "category"]
+    ):
+        ids = batch.column("id").to_pylist()
+        names = batch.column("name").to_pylist()
+        attrs = batch.column("attributes").to_pylist()
+        cats = batch.column("category").to_pylist()
+        for item_id, name, attribute, category in zip(ids, names, attrs, cats):
+            if item_id in required_ids:
+                texts[item_id] = item_text(
+                    prepare_item(item_id, name, attribute, category), max_attrs=max_attrs
+                )
+    return texts
+
+
 def category_codes(match_df, items_by_id, category_map):
     """Integer code of the pair's category, as a float column with NaN for
     unknown.
