@@ -8,4 +8,6 @@ __pycache__/
 *.bin
 .ipynb_checkpoints/
 ce_model/
+base_model/
 *.npy
+*.safetensors
