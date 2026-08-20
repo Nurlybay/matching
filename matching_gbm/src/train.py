@@ -7,35 +7,56 @@ import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import average_precision_score, roc_auc_score
-from sklearn.model_selection import GroupShuffleSplit
-
 from src.features import FEATURE_NAMES
-from src.pipeline import (
-    build_feature_matrix,
-    connected_component_groups,
-    load_items_by_id,
-    referenced_ids,
-)
+from src.pipeline import build_feature_matrix, load_items_by_id, referenced_ids
+from src.split import human_train_val_indices, valid_pairs_mask
 
 LLM_BASE_WEIGHT = 1.0
 
 
-def build_source(match_path, items_by_id, weight_fn, n_jobs, drop_targets=None, exclude_items=None):
+def attach_ce_scores(feats, ce_scores_path, expected_rows, label):
+    """Appends cross-encoder logits as a trailing feature column.
+
+    The .npy must be aligned row-for-row with the matches file as read from
+    disk — the length check is what catches a stale score file produced from
+    a different or filtered matches file, which would otherwise silently
+    misalign every score by an unknown offset.
+    """
+    if not ce_scores_path:
+        return feats
+    scores = np.load(ce_scores_path)
+    if len(scores) != expected_rows:
+        raise ValueError(
+            f"{label} CE scores length {len(scores)} != {expected_rows} rows in the "
+            f"matches file; regenerate them with src.ce_score against this exact file"
+        )
+    return np.hstack([feats, scores.reshape(-1, 1).astype(np.float32)])
+
+
+def build_source(match_path, items_by_id, weight_fn, n_jobs, drop_targets=None,
+                 exclude_items=None, ce_scores_path=None):
     match_df = pd.read_parquet(match_path)
+    feats = build_feature_matrix(match_df, items_by_id, n_jobs=n_jobs)
+    feats = attach_ce_scores(feats, ce_scores_path, len(match_df), "llm")
+    target = match_df["target"].values
+
     if exclude_items:
         # Items already spent on the human validation split must not come
         # back in through an LLM-labeled row reusing the same item — that
         # would let the model see a near-duplicate of a held-out pair
-        # during training.
-        touches_excluded = match_df["id1"].isin(exclude_items) | match_df["id2"].isin(exclude_items)
-        match_df = match_df[~touches_excluded].reset_index(drop=True)
+        # during training. Applied after feature building so CE scores, which
+        # are aligned to the unfiltered file, stay in step.
+        touches_excluded = (
+            match_df["id1"].isin(exclude_items) | match_df["id2"].isin(exclude_items)
+        ).values
+        feats = feats[~touches_excluded]
+        target = target[~touches_excluded]
 
-    feats = build_feature_matrix(match_df, items_by_id, n_jobs=n_jobs)
-    target = match_df["target"].values
-
-    # An all-NaN row means one of the pair's items wasn't in items_by_id —
-    # no signal to train on (unlike at inference, we're free to drop these).
-    valid = ~np.isnan(feats).all(axis=1)
+    # An all-NaN row across the *string* features means one of the pair's items
+    # wasn't in items_by_id — no signal to train on (unlike at inference, we're
+    # free to drop these). Restricted to those columns so the check doesn't
+    # change meaning depending on whether a CE score column is attached.
+    valid = ~np.isnan(feats[:, : len(FEATURE_NAMES)]).all(axis=1)
     if drop_targets is not None:
         valid &= ~np.isin(target, drop_targets)
 
@@ -61,7 +82,25 @@ def main():
     parser.add_argument("--human_weights", default="1,3,5,10",
                          help="comma-separated HUMAN_WEIGHT candidates to sweep; "
                               "the best one (by held-out human ROC-AUC) is kept")
+    parser.add_argument("--ce_scores_path", default=None,
+                         help="optional .npy of cross-encoder logits aligned to "
+                              "matches_path, added as an extra feature column")
+    parser.add_argument("--ce_scores_llm_path", default=None,
+                         help="same for matches_llm_path")
     args = parser.parse_args()
+
+    feature_names = list(FEATURE_NAMES)
+    if args.ce_scores_path:
+        feature_names.append("ce_score")
+
+    # Both sources are vstacked into one training matrix, so either both carry
+    # a CE column or neither does — otherwise the widths differ and the stack
+    # fails (or worse, would silently misalign if the widths happened to match).
+    if not args.skip_llm and bool(args.ce_scores_path) != bool(args.ce_scores_llm_path):
+        parser.error(
+            "--ce_scores_path and --ce_scores_llm_path must be given together "
+            "(or use --skip_llm to train on human labels only)"
+        )
 
     print("[1/6] Loading items (human subset)...")
     items_human = load_items_by_id(args.items_human_path)
@@ -69,7 +108,8 @@ def main():
     print("[2/6] Building features for human-labeled matches...")
     match_h_df = pd.read_parquet(args.matches_path)
     feats_h_all = build_feature_matrix(match_h_df, items_human, n_jobs=args.n_jobs)
-    valid_h = ~np.isnan(feats_h_all).all(axis=1)
+    feats_h_all = attach_ce_scores(feats_h_all, args.ce_scores_path, len(match_h_df), "human")
+    valid_h = valid_pairs_mask(match_h_df, items_human)
     match_h_df = match_h_df[valid_h].reset_index(drop=True)
     feats_h_all = feats_h_all[valid_h]
     y_h_all = (match_h_df["target"].values >= 0.5).astype(np.int32)
@@ -78,16 +118,10 @@ def main():
 
     print("[3/6] Holding out a validation split from human labels ONLY, "
           "grouped by connected item clusters...")
-    # Plain random splitting would let pairs sharing an item — or transitively
-    # linked through a chain of shared items, as near-duplicate clusters
-    # commonly are — land on both sides, so the model gets scored partly on
-    # near-copies of what it trained on. GroupShuffleSplit keeps each
-    # connected cluster entirely on one side.
-    groups_h = connected_component_groups(match_h_df["id1"].values, match_h_df["id2"].values)
+    train_idx, val_idx, groups_h = human_train_val_indices(
+        match_h_df["id1"].values, match_h_df["id2"].values
+    )
     print(f"  -> {len(np.unique(groups_h))} connected components among {len(groups_h)} human pairs")
-
-    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=1234)
-    train_idx, val_idx = next(gss.split(feats_h_all, y_h_all, groups=groups_h))
 
     h_train_feats, h_val_feats = feats_h_all[train_idx], feats_h_all[val_idx]
     y_h_train, y_h_val = y_h_all[train_idx], y_h_all[val_idx]
@@ -98,7 +132,7 @@ def main():
     del match_h_df, feats_h_all, y_h_all
 
     if args.skip_llm:
-        feats_l = np.empty((0, len(FEATURE_NAMES)), dtype=np.float32)
+        feats_l = np.empty((0, len(feature_names)), dtype=np.float32)
         y_l = np.empty((0,), dtype=np.int32)
         w_l = np.empty((0,), dtype=np.float32)
     else:
@@ -118,6 +152,7 @@ def main():
             n_jobs=args.n_jobs,
             drop_targets=[0.5],
             exclude_items=val_items,
+            ce_scores_path=args.ce_scores_llm_path,
         )
         print(f"  -> {len(y_l)} pairs (target==0.5 and val-item overlap dropped), "
               f"positive rate {y_l.mean():.3f}")
@@ -163,7 +198,7 @@ def main():
         best_clf, h_val_feats[sample_idx], y_h_val[sample_idx],
         scoring="roc_auc", n_repeats=3, random_state=1234, n_jobs=args.n_jobs,
     )
-    for name, imp in sorted(zip(FEATURE_NAMES, perm.importances_mean), key=lambda x: -x[1]):
+    for name, imp in sorted(zip(feature_names, perm.importances_mean), key=lambda x: -x[1]):
         print(f"  {name}: {imp:.4f}")
 
     joblib.dump(best_clf, args.output_model_path)

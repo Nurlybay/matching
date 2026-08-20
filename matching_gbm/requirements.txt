@@ -1,5 +1,19 @@
+# Dev/training environment. The submission runs inside
+# odsai/ecup26-matching-baseline:1.0, which already ships torch + transformers;
+# metadata.json's entry point does not install anything from this file.
+
+# Core — versions the pipeline has actually been run against.
 pandas==3.0.5
 numpy==2.5.2
 scikit-learn==1.9.0
 joblib==1.5.3
 pyarrow==25.0.1
+
+# Cross-encoder. torch is intentionally unpinned: the right wheel depends on
+# the CUDA build (a Blackwell card such as the RTX 5060 Ti needs cu128 wheels,
+# i.e. torch>=2.7 — older builds fail with "no kernel image available").
+torch>=2.7
+transformers>=4.40
+# Required by the XLM-R/SentencePiece tokenizer used by the multilingual
+# cross-encoder; without it AutoTokenizer refuses to build the fast tokenizer.
+sentencepiece>=0.2

@@ -61,6 +61,24 @@ def prepare_item(item_id, name, attributes, category):
     }
 
 
+def item_text(item, max_attrs=12):
+    """Flat text for a transformer encoder.
+
+    Attributes keep their original JSON order, which in this catalog tends to
+    lead with the identifying fields (артикул, бренд, партномер) — so the
+    max_attrs cut keeps the discriminative ones and drops boilerplate tails
+    like «примечание» or «цена за».
+    """
+    parts = [item["name"]]
+    if item["category"]:
+        parts.append(item["category"])
+    attrs = item["attrs"]
+    if attrs:
+        kv = list(attrs.items())[:max_attrs]
+        parts.append(" ".join(f"{k}: {v}" for k, v in kv))
+    return " | ".join(parts)
+
+
 def _seq_ratio(a, b):
     # Both empty: nothing to compare, not a match — NaN, not a score.
     # Exactly one empty: a real, informative answer (they differ maximally).
