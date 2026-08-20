@@ -1,15 +1,7 @@
-import multiprocessing as mp
-
 import numpy as np
 import pandas as pd
 
 from src.features import FEATURE_NAMES, pair_features, prepare_item
-
-# Populated via set_items_by_id() before forking worker processes, so children
-# inherit it through copy-on-write instead of each one paying to pickle/unpickle
-# a multi-million-entry dict. Only correct with the "fork" start method
-# (default on Linux) — on macOS/Windows n_jobs>1 silently falls back to n_jobs=1.
-_ITEMS_BY_ID = None
 
 
 def referenced_ids(match_path):
@@ -40,7 +32,7 @@ def _features_chunk(id1_chunk, id2_chunk, items_by_id):
     n = len(id1_chunk)
     feats = np.empty((n, len(FEATURE_NAMES)), dtype=np.float32)
     keep = np.ones(n, dtype=bool)
-    prepared_cache = {}  # scoped to this chunk only — freed when the chunk returns
+    prepared_cache = {}  # scoped to this chunk only — dropped when the chunk ends
 
     def get_prepared(item_id):
         prepared = prepared_cache.get(item_id)
@@ -62,36 +54,30 @@ def _features_chunk(id1_chunk, id2_chunk, items_by_id):
     return feats, keep
 
 
-def _features_chunk_global(args):
-    id1_chunk, id2_chunk = args
-    return _features_chunk(id1_chunk, id2_chunk, _ITEMS_BY_ID)
-
-
 def build_feature_matrix(match_df, items_by_id, n_jobs=1, chunk_size=200_000):
+    """Processes pairs in fixed-size chunks so the per-item prepared-object
+    cache stays bounded regardless of dataset size.
+
+    n_jobs is currently ignored: an earlier multiprocessing.Pool(fork) version
+    of this looked like free parallelism, but CPython bumps every touched
+    object's refcount — a write — so "shared" pages get copy-on-write
+    duplicated across workers as soon as they're read, not just written.
+    With a ~70GB items dict that silently reproduced the exact memory blowup
+    forking was meant to avoid, without any visible error. Sequential,
+    chunked processing is slower but bounded and predictable; parallelizing
+    this for real needs the item data in true shared memory (e.g. Arrow IPC
+    /multiprocessing.shared_memory), not plain Python objects.
+    """
     id1 = match_df["id1"].values
     id2 = match_df["id2"].values
     n = len(match_df)
 
-    can_fork = mp.get_start_method(allow_none=True) in (None, "fork") and mp.get_all_start_methods().count("fork") > 0
-    if n_jobs <= 1 or n <= chunk_size or not can_fork:
-        return _features_chunk(id1, id2, items_by_id)
+    feats_parts, keep_parts = [], []
+    for i in range(0, n, chunk_size):
+        f, k = _features_chunk(id1[i : i + chunk_size], id2[i : i + chunk_size], items_by_id)
+        feats_parts.append(f)
+        keep_parts.append(k)
 
-    global _ITEMS_BY_ID
-    _ITEMS_BY_ID = items_by_id  # set before Pool() so fork() copies it via COW
-
-    ctx = mp.get_context("fork")
-    chunks = [
-        (id1[i : i + chunk_size], id2[i : i + chunk_size])
-        for i in range(0, n, chunk_size)
-    ]
-    # fork() on a parent with a large RSS (the item catalog) pays a real, roughly
-    # linear-in-process-count cost to duplicate page tables; forking more workers
-    # than there is work for just adds that cost for nothing.
-    n_workers = min(n_jobs, len(chunks))
-    with ctx.Pool(processes=n_workers) as pool:
-        results = pool.map(_features_chunk_global, chunks)
-
-    _ITEMS_BY_ID = None
-    feats = np.concatenate([r[0] for r in results], axis=0)
-    keep = np.concatenate([r[1] for r in results], axis=0)
+    feats = np.concatenate(feats_parts, axis=0)
+    keep = np.concatenate(keep_parts, axis=0)
     return feats, keep
