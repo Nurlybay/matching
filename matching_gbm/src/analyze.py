@@ -1,12 +1,12 @@
 import argparse
 
-import joblib
 import numpy as np
 import pandas as pd
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 from src.features import item_text, prepare_item
-from src.pipeline import build_feature_matrix, load_items_by_id
+from src.model_io import load_bundle
+from src.pipeline import build_full_features, load_items_by_id
 from src.split import human_train_val_indices, valid_pairs_mask
 
 
@@ -30,13 +30,14 @@ def main():
     print("Loading and rebuilding the validation split...")
     items_by_id = load_items_by_id(args.items_human_path)
     match_df = pd.read_parquet(args.matches_path)
-    feats = build_feature_matrix(match_df, items_by_id, n_jobs=1)
 
-    if args.ce_scores_path:
-        ce = np.load(args.ce_scores_path)
-        if len(ce) != len(match_df):
-            raise ValueError(f"CE scores length {len(ce)} != {len(match_df)} rows")
-        feats = np.hstack([feats, ce.reshape(-1, 1).astype(np.float32)])
+    clf, category_map, _ = load_bundle(args.model_path)
+    feats = build_full_features(
+        match_df, items_by_id,
+        category_map=category_map,
+        ce_scores=np.load(args.ce_scores_path) if args.ce_scores_path else None,
+        n_jobs=1,
+    )
 
     mask = valid_pairs_mask(match_df, items_by_id)
     match_df = match_df[mask].reset_index(drop=True)
@@ -46,7 +47,6 @@ def main():
     val = match_df.iloc[val_idx].reset_index(drop=True)
     y = (val["target"].values >= 0.5).astype(int)
 
-    clf = joblib.load(args.model_path)
     p = clf.predict_proba(feats[val_idx])[:, 1]
 
     print(f"\n=== Overall (n={len(y)}, positive rate {y.mean():.3f}) ===")

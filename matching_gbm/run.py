@@ -2,11 +2,11 @@ import argparse
 import os
 import time
 
-import joblib
 import numpy as np
 import pandas as pd
 
-from src.pipeline import build_feature_matrix, load_items_by_id
+from src.model_io import load_bundle
+from src.pipeline import build_full_features, load_items_by_id
 
 MODEL_PATH = "gbm_model.joblib"
 CE_MODEL_DIR = "ce_model"
@@ -29,27 +29,33 @@ def main() -> None:
     match_df = pd.read_parquet(args.matches_path)
     print(f"  -> {len(items_by_id)} items, {len(match_df)} pairs ({time.time() - t0:.1f}s)")
 
-    print("[2/4] Building string features...")
-    feats = build_feature_matrix(match_df, items_by_id, n_jobs=1)
-    print(f"  -> {feats.shape} ({time.time() - t0:.1f}s)")
+    # The category map comes from the bundle, never rebuilt from the test items:
+    # renumbering the categories would feed the model codes that mean something
+    # different than they did at fit time.
+    clf, category_map, _ = load_bundle(MODEL_PATH)
 
+    ce_scores = None
     if use_ce:
         # Imported lazily so a GBM-only submission never pays the torch import
         # or CUDA init, which matter against the 1-minute check-stage limit.
         from src.ce_score import score_match_df
 
-        print("[3/4] Scoring pairs with the cross-encoder...")
+        print("[2/4] Scoring pairs with the cross-encoder...")
         ce_scores = score_match_df(
             match_df, items_by_id, CE_MODEL_DIR,
             batch_size=args.ce_batch_size, max_length=args.ce_max_length,
         )
-        feats = np.hstack([feats, ce_scores.reshape(-1, 1).astype(np.float32)])
-        print(f"  -> ce_score attached ({time.time() - t0:.1f}s)")
+        print(f"  -> scored ({time.time() - t0:.1f}s)")
     else:
-        print("[3/4] No ce_model/ directory — running with string features only.")
+        print("[2/4] No ce_model/ directory — running with string features only.")
+
+    print("[3/4] Building features...")
+    feats = build_full_features(
+        match_df, items_by_id, category_map=category_map, ce_scores=ce_scores, n_jobs=1
+    )
+    print(f"  -> {feats.shape} ({time.time() - t0:.1f}s)")
 
     print("[4/4] Predicting and saving...")
-    clf = joblib.load(MODEL_PATH)
     if clf.n_features_in_ != feats.shape[1]:
         raise ValueError(
             f"model expects {clf.n_features_in_} features but got {feats.shape[1]}; "

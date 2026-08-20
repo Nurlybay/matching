@@ -8,36 +8,38 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import average_precision_score, roc_auc_score
 from src.features import FEATURE_NAMES
-from src.pipeline import build_feature_matrix, load_items_by_id, referenced_ids
+from src.model_io import save_bundle
+from src.pipeline import (
+    build_full_features,
+    full_feature_names,
+    load_items_by_id,
+    referenced_ids,
+)
 from src.split import human_train_val_indices, valid_pairs_mask
 
 LLM_BASE_WEIGHT = 1.0
 
 
-def attach_ce_scores(feats, ce_scores_path, expected_rows, label):
-    """Appends cross-encoder logits as a trailing feature column.
+def load_ce_scores(path):
+    return np.load(path) if path else None
 
-    The .npy must be aligned row-for-row with the matches file as read from
-    disk — the length check is what catches a stale score file produced from
-    a different or filtered matches file, which would otherwise silently
-    misalign every score by an unknown offset.
-    """
-    if not ce_scores_path:
-        return feats
-    scores = np.load(ce_scores_path)
-    if len(scores) != expected_rows:
-        raise ValueError(
-            f"{label} CE scores length {len(scores)} != {expected_rows} rows in the "
-            f"matches file; regenerate them with src.ce_score against this exact file"
-        )
-    return np.hstack([feats, scores.reshape(-1, 1).astype(np.float32)])
+
+def build_category_map(items_by_id):
+    """Stable category -> code mapping, sorted so it doesn't depend on dict
+    iteration order or on which items happen to appear first."""
+    cats = sorted({raw[2] for raw in items_by_id.values() if raw[2]})
+    return {c: i for i, c in enumerate(cats)}
 
 
 def build_source(match_path, items_by_id, weight_fn, n_jobs, drop_targets=None,
-                 exclude_items=None, ce_scores_path=None):
+                 exclude_items=None, ce_scores_path=None, category_map=None):
     match_df = pd.read_parquet(match_path)
-    feats = build_feature_matrix(match_df, items_by_id, n_jobs=n_jobs)
-    feats = attach_ce_scores(feats, ce_scores_path, len(match_df), "llm")
+    feats = build_full_features(
+        match_df, items_by_id,
+        category_map=category_map,
+        ce_scores=load_ce_scores(ce_scores_path),
+        n_jobs=n_jobs,
+    )
     target = match_df["target"].values
 
     if exclude_items:
@@ -87,11 +89,14 @@ def main():
                               "matches_path, added as an extra feature column")
     parser.add_argument("--ce_scores_llm_path", default=None,
                          help="same for matches_llm_path")
+    parser.add_argument("--no_category", action="store_true",
+                         help="drop the category feature (ablation)")
     args = parser.parse_args()
 
-    feature_names = list(FEATURE_NAMES)
-    if args.ce_scores_path:
-        feature_names.append("ce_score")
+    use_category = not args.no_category
+    feature_names = full_feature_names(
+        use_category=use_category, use_ce=bool(args.ce_scores_path)
+    )
 
     # Both sources are vstacked into one training matrix, so either both carry
     # a CE column or neither does — otherwise the widths differ and the stack
@@ -104,11 +109,18 @@ def main():
 
     print("[1/6] Loading items (human subset)...")
     items_human = load_items_by_id(args.items_human_path)
+    category_map = build_category_map(items_human) if use_category else None
+    if category_map:
+        print(f"  -> {len(category_map)} categories")
 
     print("[2/6] Building features for human-labeled matches...")
     match_h_df = pd.read_parquet(args.matches_path)
-    feats_h_all = build_feature_matrix(match_h_df, items_human, n_jobs=args.n_jobs)
-    feats_h_all = attach_ce_scores(feats_h_all, args.ce_scores_path, len(match_h_df), "human")
+    feats_h_all = build_full_features(
+        match_h_df, items_human,
+        category_map=category_map,
+        ce_scores=load_ce_scores(args.ce_scores_path),
+        n_jobs=args.n_jobs,
+    )
     valid_h = valid_pairs_mask(match_h_df, items_human)
     match_h_df = match_h_df[valid_h].reset_index(drop=True)
     feats_h_all = feats_h_all[valid_h]
@@ -153,6 +165,7 @@ def main():
             drop_targets=[0.5],
             exclude_items=val_items,
             ce_scores_path=args.ce_scores_llm_path,
+            category_map=category_map,
         )
         print(f"  -> {len(y_l)} pairs (target==0.5 and val-item overlap dropped), "
               f"positive rate {y_l.mean():.3f}")
@@ -168,6 +181,13 @@ def main():
         X_train = np.vstack([h_train_feats, feats_l])
         y_train = np.concatenate([y_h_train, y_l])
 
+        # The category column holds integer codes, not an ordered quantity —
+        # declaring it categorical lets the tree split on arbitrary subsets of
+        # categories instead of on meaningless thresholds like "code < 7".
+        categorical = (
+            [feature_names.index("category_code")] if use_category else None
+        )
+
         clf = HistGradientBoostingClassifier(
             max_iter=500,
             learning_rate=0.05,
@@ -176,6 +196,7 @@ def main():
             early_stopping=True,
             n_iter_no_change=20,
             validation_fraction=0.1,
+            categorical_features=categorical,
             random_state=1234,
         )
         clf.fit(X_train, y_train, sample_weight=w_train)
@@ -201,7 +222,7 @@ def main():
     for name, imp in sorted(zip(feature_names, perm.importances_mean), key=lambda x: -x[1]):
         print(f"  {name}: {imp:.4f}")
 
-    joblib.dump(best_clf, args.output_model_path)
+    save_bundle(args.output_model_path, best_clf, category_map, feature_names)
     print(f"Saved best model (HUMAN_WEIGHT={best_hw:g}) to {args.output_model_path}")
 
 

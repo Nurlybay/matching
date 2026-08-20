@@ -4,6 +4,37 @@ import re
 from difflib import SequenceMatcher
 
 _TOKEN_RE = re.compile(r"[a-zA-Zа-яА-ЯёЁ0-9]+")
+# Numbers carry the distinguishing detail in this catalog far more often than
+# their share of the text suggests: diopters (-2.00 vs -3.00), curtain sizes
+# (300х220 vs 220), РЦ ranges (66-68 vs 68-70). Captured with decimals so
+# "1.56" stays one number rather than splitting into 1 and 56.
+_NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)?")
+
+# Latin/Cyrillic spellings of the same brand coexist throughout the data
+# ("asics" / "асикс"), and token-level features score those as zero overlap.
+# Folding Cyrillic onto Latin makes them comparable — approximately, which is
+# enough since the comparison downstream is fuzzy anyway.
+_TRANSLIT = str.maketrans({
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "j", "з": "z", "и": "i", "й": "i", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "h", "ц": "c", "ч": "c", "ш": "s", "щ": "s", "ъ": "",
+    "ы": "y", "ь": "", "э": "e", "ю": "u", "я": "a",
+})
+
+# Attribute keys that identify a specific manufactured article. A match on one
+# of these is close to decisive, and it is exactly the signal a subword
+# tokenizer destroys — which is why Автотовары, where these dominate, barely
+# improved when the cross-encoder was added (0.6687 -> 0.6734 vs +0.128 for
+# Красота и гигиена).
+_ID_KEYS = (
+    "артикул",
+    "артикул производителя",
+    "партномер (артикул производителя)",
+    "oem-номер",
+    "код товара",
+    "модель",
+)
 
 NAN = math.nan
 
@@ -21,6 +52,10 @@ FEATURE_NAMES = [
     "attr_count_diff",
     "attrs1_empty",
     "attrs2_empty",
+    "name_translit_ratio",
+    "number_jaccard",
+    "number_count_diff",
+    "id_attr_match",
 ]
 
 
@@ -47,6 +82,27 @@ def tokenize(text):
     return frozenset(_TOKEN_RE.findall(text.lower()))
 
 
+def transliterate(text):
+    return text.lower().translate(_TRANSLIT)
+
+
+def numbers(text):
+    """Numeric tokens, comma normalized to a dot so "1,56" and "1.56" agree."""
+    return frozenset(m.group().replace(",", ".") for m in _NUMBER_RE.finditer(text))
+
+
+def identifiers(attrs):
+    """Non-empty values of the identifying attribute keys, normalized."""
+    out = set()
+    for key in _ID_KEYS:
+        value = attrs.get(key)
+        if value and value not in ("", "-", "нет"):
+            # Separators are inconsistent across sellers ("8500892sx" vs
+            # "8500892-sx"), so compare on alphanumerics only.
+            out.add("".join(ch for ch in value if ch.isalnum()))
+    return out
+
+
 def prepare_item(item_id, name, attributes, category):
     """Precompute derived fields once per item so pair_features stays O(1) allocation-light."""
     name = str(name) if name is not None else ""
@@ -55,9 +111,12 @@ def prepare_item(item_id, name, attributes, category):
         "id": item_id,
         "name": name,
         "name_tokens": tokenize(name),
+        "name_translit": transliterate(name),
+        "name_numbers": numbers(name),
         "category": str(category) if category is not None else "",
         "attrs": attrs,
         "attr_value_tokens": tokenize(" ".join(attrs.values())),
+        "identifiers": identifiers(attrs),
     }
 
 
@@ -98,6 +157,19 @@ def _jaccard(a, b):
     return len(a & b) / len(union)
 
 
+def _id_match(ids1, ids2):
+    """1.0 if the two items share an identifier, 0.0 if both have identifiers
+    but none coincide, NaN if either side has none to compare.
+
+    The NaN case is the majority — most listings carry no артикул — and
+    collapsing it into 0.0 would tell the model "checked, they differ", which
+    is a different and false claim.
+    """
+    if not ids1 or not ids2:
+        return NAN
+    return float(bool(ids1 & ids2))
+
+
 def pair_features(item1, item2):
     n1, n2 = item1["name"], item2["name"]
     t1, t2 = item1["name_tokens"], item2["name_tokens"]
@@ -133,4 +205,8 @@ def pair_features(item1, item2):
         float(abs(len(a1) - len(a2))),
         float(len(a1) == 0),
         float(len(a2) == 0),
+        _seq_ratio(item1["name_translit"], item2["name_translit"]),
+        _jaccard(item1["name_numbers"], item2["name_numbers"]),
+        float(abs(len(item1["name_numbers"]) - len(item2["name_numbers"]))),
+        _id_match(item1["identifiers"], item2["identifiers"]),
     )

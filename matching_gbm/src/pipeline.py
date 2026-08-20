@@ -111,3 +111,64 @@ def build_feature_matrix(match_df, items_by_id, n_jobs=1, chunk_size=200_000):
         for i in range(0, n, chunk_size)
     ]
     return np.concatenate(feats_parts, axis=0)
+
+
+def category_codes(match_df, items_by_id, category_map):
+    """Integer code of the pair's category, as a float column with NaN for
+    unknown.
+
+    Candidates are always generated inside one category, which is why the
+    *agreement* feature `category_match` is constant and worthless — but which
+    category it is turns out to matter a lot: measured per-category ROC-AUC
+    ranges from 0.62 (Красота и гигиена) to 0.89 (Аптека). Without this the
+    model is solving twenty rather different problems while blind to which one
+    it is facing.
+
+    NaN rather than a sentinel integer for unseen categories: HistGradient-
+    BoostingClassifier handles missing values natively, whereas an unseen
+    integer code would fall outside every bin learned at fit time.
+    """
+    codes = np.full(len(match_df), np.nan, dtype=np.float32)
+    for row, item_id in enumerate(match_df["id1"].values):
+        raw = items_by_id.get(item_id)
+        if raw is None:
+            continue
+        code = category_map.get(raw[2])
+        if code is not None:
+            codes[row] = code
+    return codes.reshape(-1, 1)
+
+
+def build_full_features(match_df, items_by_id, category_map=None, ce_scores=None,
+                        n_jobs=1, chunk_size=200_000):
+    """Assembles the complete matrix in a fixed column order:
+    string features, then category code, then CE score.
+
+    Both training and inference go through this one function — the column
+    order has to match exactly between them, and duplicating the assembly in
+    two places is how that silently drifts.
+    """
+    feats = build_feature_matrix(match_df, items_by_id, n_jobs=n_jobs, chunk_size=chunk_size)
+    parts = [feats]
+
+    if category_map is not None:
+        parts.append(category_codes(match_df, items_by_id, category_map))
+
+    if ce_scores is not None:
+        if len(ce_scores) != len(match_df):
+            raise ValueError(
+                f"CE scores length {len(ce_scores)} != {len(match_df)} rows in the "
+                f"matches file; regenerate them against this exact file"
+            )
+        parts.append(ce_scores.reshape(-1, 1).astype(np.float32))
+
+    return np.hstack(parts) if len(parts) > 1 else parts[0]
+
+
+def full_feature_names(use_category=False, use_ce=False):
+    names = list(FEATURE_NAMES)
+    if use_category:
+        names.append("category_code")
+    if use_ce:
+        names.append("ce_score")
+    return names
