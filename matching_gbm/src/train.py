@@ -8,6 +8,7 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import average_precision_score, roc_auc_score
 from src.features import FEATURE_NAMES
+from src.metrics import macro_pr_auc, pair_categories
 from src.model_io import save_bundle
 from src.pipeline import (
     build_full_features,
@@ -126,6 +127,9 @@ def main():
     feats_h_all = feats_h_all[valid_h]
     y_h_all = (match_h_df["target"].values >= 0.5).astype(np.int32)
     print(f"  -> {len(y_h_all)} pairs, positive rate {y_h_all.mean():.3f}")
+    # Keep only the category per item — the names and attribute blobs are what
+    # make that dict large, and per-category scoring needs nothing else.
+    cat_by_id = {k: v[2] for k, v in items_human.items()}
     del items_human
 
     print("[3/6] Holding out a validation split from human labels ONLY, "
@@ -141,6 +145,7 @@ def main():
           f"(split by group, so not exactly 80/20)")
 
     val_items = set(match_h_df.iloc[val_idx]["id1"]) | set(match_h_df.iloc[val_idx]["id2"])
+    val_cats = pair_categories(match_h_df.iloc[val_idx]["id1"].values, cat_by_id)
     del match_h_df, feats_h_all, y_h_all
 
     if args.skip_llm:
@@ -204,20 +209,30 @@ def main():
         val_pred = clf.predict_proba(h_val_feats)[:, 1]
         auc = roc_auc_score(y_h_val, val_pred)
         ap = average_precision_score(y_h_val, val_pred)
-        print(f"  HUMAN_WEIGHT={hw:g}: human-val ROC-AUC={auc:.4f} PR-AUC={ap:.4f}")
+        macro_ap, per_cat = macro_pr_auc(y_h_val, val_pred, val_cats)
+        print(f"  HUMAN_WEIGHT={hw:g}: macro-PR-AUC={macro_ap:.4f} "
+              f"(ROC-AUC={auc:.4f} pooled-PR-AUC={ap:.4f})")
 
-        if best is None or auc > best[0]:
-            best = (auc, hw, clf)
+        # Selected on the competition's own metric — per-category PR-AUC,
+        # averaged over categories — not on ROC-AUC. They disagree: pooled
+        # metrics weight a category by its pair count, and ROC-AUC is far less
+        # sensitive than PR-AUC to ranking quality at the top.
+        if best is None or macro_ap > best[0]:
+            best = (macro_ap, hw, clf, per_cat)
 
-    best_auc, best_hw, best_clf = best
-    print(f"Best HUMAN_WEIGHT={best_hw:g} (human-val ROC-AUC={best_auc:.4f})")
+    best_macro, best_hw, best_clf, best_per_cat = best
+    print(f"Best HUMAN_WEIGHT={best_hw:g} (macro-PR-AUC={best_macro:.4f})")
+
+    print("Per-category PR-AUC:")
+    for cat, score in sorted(best_per_cat.items(), key=lambda x: x[1]):
+        print(f"  {score:.4f}  {cat}")
 
     print("Permutation importance (subsample of held-out human val set)...")
     sample_n = min(len(h_val_feats), 200_000)
     sample_idx = np.random.RandomState(1234).choice(len(h_val_feats), sample_n, replace=False)
     perm = permutation_importance(
         best_clf, h_val_feats[sample_idx], y_h_val[sample_idx],
-        scoring="roc_auc", n_repeats=3, random_state=1234, n_jobs=args.n_jobs,
+        scoring="average_precision", n_repeats=3, random_state=1234, n_jobs=args.n_jobs,
     )
     for name, imp in sorted(zip(feature_names, perm.importances_mean), key=lambda x: -x[1]):
         print(f"  {name}: {imp:.4f}")

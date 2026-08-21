@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup
 
 from src.features import item_text, prepare_item
+from src.metrics import macro_pr_auc, pair_categories
 from src.pipeline import load_item_texts, load_items_by_id
 from src.split import human_train_val_indices, valid_pairs_mask
 
@@ -89,7 +90,7 @@ def make_loaders(train_ds, val_ds, tokenizer, args, device):
     return train_loader, val_loader
 
 
-def train_stage(model, tokenizer, train_loader, val_loader, val_labels,
+def train_stage(model, tokenizer, train_loader, val_loader, val_labels, val_cats,
                 device, amp_dtype, epochs, lr, warmup_ratio, stage, save_dir=None):
     """Runs one training stage, always scoring on the same human validation set.
 
@@ -110,7 +111,7 @@ def train_stage(model, tokenizer, train_loader, val_loader, val_labels,
     loss_fn = torch.nn.BCEWithLogitsLoss()
 
     print(f"[{stage}] {len(train_loader)} steps/epoch x {epochs} epochs, lr={lr:g}")
-    best_auc = -1.0
+    best_macro = -1.0
     for epoch in range(epochs):
         model.train()
         running, seen, t0 = 0.0, 0, time.time()
@@ -138,17 +139,23 @@ def train_stage(model, tokenizer, train_loader, val_loader, val_labels,
         val_scores = predict_scores(model, val_loader, device, amp_dtype)
         auc = roc_auc_score(val_labels, val_scores)
         ap = average_precision_score(val_labels, val_scores)
-        print(f"  [{stage}] epoch {epoch}: human-val ROC-AUC={auc:.4f} PR-AUC={ap:.4f}")
+        macro_ap, _ = macro_pr_auc(val_labels, val_scores, val_cats)
+        print(f"  [{stage}] epoch {epoch}: macro-PR-AUC={macro_ap:.4f} "
+              f"(ROC-AUC={auc:.4f} pooled-PR-AUC={ap:.4f})")
 
-        if auc > best_auc:
-            best_auc = auc
+        # Checkpoint on the competition metric. Selecting the epoch by ROC-AUC
+        # optimizes a different quantity: it is insensitive to how many
+        # negatives sit above the positives at the very top of the ranking,
+        # which is most of what PR-AUC measures.
+        if macro_ap > best_macro:
+            best_macro = macro_ap
             if save_dir:
                 os.makedirs(save_dir, exist_ok=True)
                 model.save_pretrained(save_dir)
                 tokenizer.save_pretrained(save_dir)
                 print(f"  [{stage}] saved to {save_dir} (best so far)")
 
-    return best_auc
+    return best_macro
 
 
 def load_pretrain_pairs(args, exclude_items):
@@ -254,6 +261,9 @@ def main():
     print("[3/5] Building texts...")
     texts1, texts2 = build_pair_texts(match_df, items_by_id, args.max_attrs)
     labels = (match_df["target"].values >= 0.5).astype(np.float32)
+    # Category per item, kept for the per-category metric after the rest of
+    # the item data is released.
+    cat_by_id = {k: v[2] for k, v in items_by_id.items()}
     del items_by_id
 
     if args.max_train_pairs:
@@ -268,6 +278,7 @@ def main():
         [texts1[i] for i in val_idx], [texts2[i] for i in val_idx], labels[val_idx]
     )
     val_labels = labels[val_idx]
+    val_cats = pair_categories(match_df.iloc[val_idx]["id1"].values, cat_by_id)
 
     print("[4/5] Loading model...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
@@ -290,7 +301,7 @@ def main():
 
         pre_loader, val_loader = make_loaders(pre_ds, val_ds, tokenizer, args, device)
         train_stage(
-            model, tokenizer, pre_loader, val_loader, val_labels, device, amp_dtype,
+            model, tokenizer, pre_loader, val_loader, val_labels, val_cats, device, amp_dtype,
             epochs=args.pretrain_epochs, lr=args.pretrain_lr,
             warmup_ratio=args.warmup_ratio, stage="pretrain", save_dir=None,
         )
@@ -298,12 +309,12 @@ def main():
 
     print("[5/5] Fine-tuning on human labels...")
     train_loader, val_loader = make_loaders(train_ds, val_ds, tokenizer, args, device)
-    best_auc = train_stage(
-        model, tokenizer, train_loader, val_loader, val_labels, device, amp_dtype,
+    best_macro = train_stage(
+        model, tokenizer, train_loader, val_loader, val_labels, val_cats, device, amp_dtype,
         epochs=args.epochs, lr=args.lr, warmup_ratio=args.warmup_ratio,
         stage="finetune", save_dir=args.output_dir,
     )
-    print(f"Best human-val ROC-AUC={best_auc:.4f}")
+    print(f"Best human-val macro-PR-AUC={best_macro:.4f}")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import pandas as pd
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 from src.features import item_text, prepare_item
+from src.metrics import macro_pr_auc, pair_categories
 from src.model_io import load_bundle
 from src.pipeline import build_full_features, load_items_by_id
 from src.split import human_train_val_indices, valid_pairs_mask
@@ -49,26 +50,33 @@ def main():
 
     p = clf.predict_proba(feats[val_idx])[:, 1]
 
-    print(f"\n=== Overall (n={len(y)}, positive rate {y.mean():.3f}) ===")
-    print(f"ROC-AUC {roc_auc_score(y, p):.4f}   PR-AUC {average_precision_score(y, p):.4f}")
-
-    print("\n=== By category ===")
     # Category is shared within a pair (candidates are generated inside a
     # category), so id1's category labels the pair.
-    cat = np.array([
-        (items_by_id[i][2] if i in items_by_id else "?") for i in val["id1"].values
-    ])
+    cat = pair_categories(val["id1"].values, {i: v[2] for i, v in items_by_id.items()})
+    macro_ap, _ = macro_pr_auc(y, p, cat)
+
+    print(f"\n=== Overall (n={len(y)}, positive rate {y.mean():.3f}) ===")
+    print(f"macro-PR-AUC {macro_ap:.4f}  <- the competition metric")
+    print(f"pooled PR-AUC {average_precision_score(y, p):.4f}   "
+          f"ROC-AUC {roc_auc_score(y, p):.4f}")
+
+    print("\n=== By category (sorted by PR-AUC, worst first) ===")
     rows = []
     for c in np.unique(cat):
         sel = cat == c
         if sel.sum() < 200 or len(np.unique(y[sel])) < 2:
             continue
-        rows.append((roc_auc_score(y[sel], p[sel]), average_precision_score(y[sel], p[sel]),
-                     int(sel.sum()), float(y[sel].mean()), c))
+        ap = average_precision_score(y[sel], p[sel])
+        pos = float(y[sel].mean())
+        rows.append((ap, roc_auc_score(y[sel], p[sel]), int(sel.sum()), pos, ap / pos, c))
     rows.sort()
-    print(f"{'ROC-AUC':>8} {'PR-AUC':>8} {'n':>7} {'pos':>6}  category")
-    for auc, ap, n, pos, c in rows:
-        print(f"{auc:8.4f} {ap:8.4f} {n:7d} {pos:6.3f}  {c}")
+    # "lift" is PR-AUC over the random baseline, which for PR-AUC equals the
+    # positive rate. A category can score low simply because duplicates are
+    # rare in it while still being ranked well — the metric averages raw
+    # PR-AUC, so those categories cap the achievable mean.
+    print(f"{'PR-AUC':>8} {'ROC-AUC':>8} {'n':>7} {'pos':>6} {'lift':>6}  category")
+    for ap, auc, n, pos, lift, c in rows:
+        print(f"{ap:8.4f} {auc:8.4f} {n:7d} {pos:6.3f} {lift:6.2f}  {c}")
 
     print(f"\n=== Worst false positives (target=0, highest predicted) ===")
     neg = np.flatnonzero(y == 0)
