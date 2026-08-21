@@ -17,34 +17,78 @@ from src.split import human_train_val_indices, valid_pairs_mask
 DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 
-class PairDataset(Dataset):
-    """Holds texts, not token ids — tokenization happens in the collate_fn so
-    each batch pads to its own longest sequence instead of a global max."""
+class TextStore:
+    """Every text packed into one uint8 buffer, addressed by an offset array.
 
-    def __init__(self, texts1, texts2, labels):
-        self.texts1 = texts1
-        self.texts2 = texts2
+    A Python list of millions of strings cannot be shared with forked
+    DataLoader workers. fork gives copy-on-write, but CPython stores each
+    object's refcount in its own header, so merely *reading* a string writes to
+    its page — and every worker ends up copying the whole collection. That is
+    what the OOM killer stopped at 13000 steps of an 11M-pair run with 32
+    workers. numpy keeps the payload outside the refcounted object, so one
+    buffer is genuinely shared no matter how many workers read it.
+    """
+
+    def __init__(self, texts):
+        encoded = [t.encode("utf-8") for t in texts]
+        self.offsets = np.zeros(len(encoded) + 1, dtype=np.int64)
+        np.cumsum(np.fromiter((len(e) for e in encoded), dtype=np.int64,
+                              count=len(encoded)), out=self.offsets[1:])
+        self.data = np.frombuffer(bytearray(b"".join(encoded)), dtype=np.uint8)
+
+    def __len__(self):
+        return len(self.offsets) - 1
+
+    def get(self, i):
+        return self.data[self.offsets[i] : self.offsets[i + 1]].tobytes().decode("utf-8")
+
+
+def build_text_store(id_to_text):
+    """TextStore plus the id -> position map used to translate pair ids into
+    integer indices. The map stays in the parent; workers only ever touch the
+    numpy arrays."""
+    ids = list(id_to_text)
+    store = TextStore([id_to_text[i] for i in ids])
+    return store, {item_id: pos for pos, item_id in enumerate(ids)}
+
+
+class PairDataset(Dataset):
+    """Indices into a TextStore, not strings — see TextStore for why.
+
+    Tokenization happens in the collate_fn so each batch pads to its own
+    longest sequence instead of a global max.
+    """
+
+    def __init__(self, store, idx1, idx2, labels):
+        self.store = store
+        self.idx1 = idx1
+        self.idx2 = idx2
         self.labels = labels
 
     def __len__(self):
         return len(self.labels)
 
     def __getitem__(self, i):
-        return self.texts1[i], self.texts2[i], self.labels[i]
+        return self.store.get(self.idx1[i]), self.store.get(self.idx2[i]), self.labels[i]
 
 
-def make_collate(tokenizer, max_length):
-    def collate(batch):
+class Collate:
+    """A class rather than a closure so it survives pickling — worker startup
+    uses spawn on macOS/Windows, which cannot ship a nested function."""
+
+    def __init__(self, tokenizer, max_length):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __call__(self, batch):
         t1, t2, labels = zip(*batch)
-        enc = tokenizer(
+        enc = self.tokenizer(
             list(t1), list(t2),
             padding=True, truncation="longest_first",
-            max_length=max_length, return_tensors="pt",
+            max_length=self.max_length, return_tensors="pt",
         )
         enc["labels"] = torch.tensor(labels, dtype=torch.float32)
         return enc
-
-    return collate
 
 
 @torch.no_grad()
@@ -61,24 +105,31 @@ def predict_scores(model, loader, device, amp_dtype):
 
 
 def build_pair_texts(match_df, items_by_id, max_attrs):
-    """Materializes one text per item actually used, then indexes pairs into it —
-    an item appearing in several pairs is only formatted once."""
-    text_cache = {}
+    """Formats one text per item actually referenced and returns it as an
+    id -> text mapping; the pair-level indices are derived from it separately."""
+    texts = {}
+    for item_id in np.concatenate([match_df["id1"].values, match_df["id2"].values]):
+        if item_id not in texts:
+            texts[item_id] = item_text(
+                prepare_item(item_id, *items_by_id[item_id]), max_attrs=max_attrs
+            )
+    return texts
 
-    def get_text(item_id):
-        text = text_cache.get(item_id)
-        if text is None:
-            text = item_text(prepare_item(item_id, *items_by_id[item_id]), max_attrs=max_attrs)
-            text_cache[item_id] = text
-        return text
 
-    texts1 = [get_text(i) for i in match_df["id1"].values]
-    texts2 = [get_text(i) for i in match_df["id2"].values]
-    return texts1, texts2
+def pair_indices(match_df, id_to_pos, rows=None):
+    """Integer index arrays into a TextStore for the given rows."""
+    id1 = match_df["id1"].values
+    id2 = match_df["id2"].values
+    if rows is not None:
+        id1, id2 = id1[rows], id2[rows]
+    return (
+        np.fromiter((id_to_pos[i] for i in id1), dtype=np.int32, count=len(id1)),
+        np.fromiter((id_to_pos[i] for i in id2), dtype=np.int32, count=len(id2)),
+    )
 
 
 def make_loaders(train_ds, val_ds, tokenizer, args, device):
-    collate = make_collate(tokenizer, args.max_length)
+    collate = Collate(tokenizer, args.max_length)
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate,
         num_workers=args.num_workers, pin_memory=(device.type == "cuda"), drop_last=True,
@@ -259,7 +310,9 @@ def main():
     print(f"  -> {len(np.unique(groups))} components; train={len(train_idx)} val={len(val_idx)}")
 
     print("[3/5] Building texts...")
-    texts1, texts2 = build_pair_texts(match_df, items_by_id, args.max_attrs)
+    human_texts = build_pair_texts(match_df, items_by_id, args.max_attrs)
+    human_store, human_pos = build_text_store(human_texts)
+    del human_texts
     labels = (match_df["target"].values >= 0.5).astype(np.float32)
     # Category per item, kept for the per-category metric after the rest of
     # the item data is released.
@@ -271,12 +324,11 @@ def main():
         print(f"  -> capped train to {len(train_idx)} pairs")
 
     val_items = set(match_df.iloc[val_idx]["id1"]) | set(match_df.iloc[val_idx]["id2"])
-    train_ds = PairDataset(
-        [texts1[i] for i in train_idx], [texts2[i] for i in train_idx], labels[train_idx]
-    )
-    val_ds = PairDataset(
-        [texts1[i] for i in val_idx], [texts2[i] for i in val_idx], labels[val_idx]
-    )
+    tr1, tr2 = pair_indices(match_df, human_pos, train_idx)
+    va1, va2 = pair_indices(match_df, human_pos, val_idx)
+    del human_pos
+    train_ds = PairDataset(human_store, tr1, tr2, labels[train_idx])
+    val_ds = PairDataset(human_store, va1, va2, labels[val_idx])
     val_labels = labels[val_idx]
     val_cats = pair_categories(match_df.iloc[val_idx]["id1"].values, cat_by_id)
 
@@ -289,15 +341,16 @@ def main():
     if args.pretrain_matches_path:
         print("[4.5/5] Building LLM pretraining set...")
         pre_df, pre_item_texts = load_pretrain_pairs(args, val_items)
-        # Lists of references into the same text objects — two pointers per
-        # pair, not two copies of the text.
-        pre_texts1 = [pre_item_texts[i] for i in pre_df["id1"].values]
-        pre_texts2 = [pre_item_texts[i] for i in pre_df["id2"].values]
+        pre_store, pre_pos = build_text_store(pre_item_texts)
         del pre_item_texts
+        pre1, pre2 = pair_indices(pre_df, pre_pos)
+        del pre_pos
+        print(f"  -> text store: {len(pre_store)} texts, "
+              f"{pre_store.data.nbytes / 1e9:.1f} GB shared across workers")
         # Soft targets, not binarized: t is the labeler's confidence, and
         # rounding it to 0/1 throws that away right where it is most useful.
         pre_labels = pre_df["target"].values.astype(np.float32)
-        pre_ds = PairDataset(pre_texts1, pre_texts2, pre_labels)
+        pre_ds = PairDataset(pre_store, pre1, pre2, pre_labels)
 
         pre_loader, val_loader = make_loaders(pre_ds, val_ds, tokenizer, args, device)
         train_stage(
@@ -305,7 +358,7 @@ def main():
             epochs=args.pretrain_epochs, lr=args.pretrain_lr,
             warmup_ratio=args.warmup_ratio, stage="pretrain", save_dir=None,
         )
-        del pre_ds, pre_loader, pre_texts1, pre_texts2, pre_df
+        del pre_ds, pre_loader, pre_store, pre1, pre2, pre_df
 
     print("[5/5] Fine-tuning on human labels...")
     train_loader, val_loader = make_loaders(train_ds, val_ds, tokenizer, args, device)
